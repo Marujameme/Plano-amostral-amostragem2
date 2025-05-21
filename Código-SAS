@@ -1,0 +1,532 @@
+PROC IMPORT DATAFILE="/home/u63366826/sasuser.v94/Trabalho amostragem 2/Agregados_por_setores_basico_BR.xlsx"
+            OUT=agregados_setores_BR
+            DBMS=XLSX
+            REPLACE;
+    GETNAMES=YES;             /* Usa os nomes das colunas do Excel */
+RUN;
+
+/*** Calculando o p_prop ***/
+proc freq data=agregados_setores_BR noprint;
+tables CD_MUN /out=pop_mun(rename=count=pop_mun);
+weight v0001;
+where CD_UF=27;
+run;
+data pop_mun;set pop_mun;
+if pop_mun<50000 then pequeno=1; else pequeno=0;
+run;
+proc freq data=pop_mun;
+tables pequeno;
+run;
+
+/*** Separando o Estado ***/
+DATA agregados_setores_AL;
+    SET agregados_setores_BR; /* Nome do dataset original */
+    WHERE NM_UF = "Alagoas";  /* Condição para filtrar */
+RUN;
+
+/*** retirando total de pessoas = 0 no setor censitário ***/
+DATA dados_al;
+    SET agregados_setores_AL;
+    IF v0001 NE 0; /* Filtra linhas onde 'variavel' não é igual a 0 */
+RUN;
+
+/*** CD_SETOR de númerica para categórica ***/
+data dados_al;
+    length CD_SETOR_char $20;          /* Define a nova variável como texto, com até 12 caracteres */
+    set dados_al;
+    CD_SETOR_char = put(CD_SETOR, BEST20.);  /* Converte a variável numérica para texto */
+    drop CD_SETOR;                     /* Remove a variável numérica original */
+    rename CD_SETOR_CHAR = CD_SETOR;         /* Renomeia a nova variável de texto para o nome original */
+run;
+data dados_al;
+    set dados_al;
+    CD_SETOR = put(CD_SETOR, BEST20.);
+run;
+
+/**** amostra ***/
+proc means data=dados_al noprint nway;
+var v0002;
+output out=nm_mun_dom(drop=_type_ rename=_freq_=tot_dom) mean=Pb;
+run;
+
+data tamanho_amostra;set nm_mun_dom;
+z=1.96;
+erro=0.02;
+deff=2.5;
+CV=sqrt(0.098*(1-0.098));
+c=140000;
+c1=600;
+c2=12;
+c3=10;
+c0=0.3*c;
+rho=(deff-1)/(Pb-1);
+p_b=round(sqrt((c2/c3)*((1-rho)/rho)));
+m_b=round((z**2*CV**2*(rho+((1-rho)/p_b)))/erro**2);
+a=round((c-c0)/(c1+c2*m_b+c3*m_b*p_b));
+amostra_final=a*m_b*p_b;
+C_final=c0+c1*a+c2*a*m_b+c3*a*m_b*p_b;
+output;
+run;
+
+/*** Totais  ***/
+proc means data=dados_al noprint nway;
+var v0002 'v0001'n;
+output out=freq_nm_mun_dom(drop=_type_ rename=_freq_=tot_set_censitario)
+sum(v0002)=tot_dom sum('v0001'n)=populacao;
+run;
+
+/*** Juntando com tamanho_amostra  ***/
+data freq_nm_mun_dom;merge freq_nm_mun_dom tamanho_amostra
+(keep= a m_b p_b amostra_final);
+run;
+
+/*** ordenando ***/
+/*** Tabela de frequencia para checar oversized com o surveyselect***/
+proc freq data=dados_al noprint;
+tables CD_MUN*NM_MUN /out=freq_nm_mun(rename=count=tot_pop);
+weight v0001;
+run;
+
+/*** vai dar erro ***/
+proc surveyselect data=freq_nm_mun sampsize=9 seed=3 
+out=amostra_mun method=pps;
+size tot_pop;
+run;
+/*** vai rodar mas estará selecionando menos do que deveria caso tenha oversized ***/
+proc surveyselect data=freq_nm_mun sampsize=9 seed=3 
+out=amostra_mun method=pps_sys;
+size tot_pop;
+run;
+/*** Colocando "M0" e "a" como macros  ***/
+proc sql;
+select sum(v0001) into:M0 from dados_al;
+select a into:a from tamanho_amostra;
+quit;
+%put &M0 &a; /*** M0 é pela quantidade de pessoas ***/
+
+/*** realizando a repetição de tamanho_amostra em freq_nm_mun para os cálculos futuros ***/
+data freq_nm_mun;if _n_=1 then set tamanho_amostra;set freq_nm_mun;
+M0=&M0; /*** também setando M0 dentro da tabela ***/
+if tot_pop>M0/a then estrato=1;else estrato=2; /*** separando o oversize por estrato ***/
+peso_mun=M0/(a*tot_pop); /*** calculando o peso ***/
+run;
+
+/*** separando a população por estratos ***/
+proc means data=freq_nm_mun noprint nway;
+var tot_pop;
+class estrato;
+output out=sum_pop_estrato(drop=_type_ rename=_freq_=mun_estrato) sum=pop_estrato;
+run;
+
+/*** selecionando pop_estrato = 2 em M02 e pop_estrato = 1 em mun1 ***/
+proc sql;
+select pop_estrato as PopAL into:M02 from sum_pop_estrato 
+where estrato=2;
+select mun_estrato as PopDF2 into:mun1 from sum_pop_estrato 
+where estrato=1;
+quit;
+%put &M02 &mun1; /*deixando como macros*/
+%put &a; /*deixando como macro*/
+
+/** Ajustando peso do oversized colocando no estrato certo **/
+data freq_nm_mun;set freq_nm_mun;
+if estrato=1 then peso_mun=1;
+if estrato=2 then peso_mun=&M02/((&a-&mun1)*tot_pop); /*ajustando o peso para os estratos sem o estrato certo*/
+/*verificacao estrato certo*/
+if tot_pop>(&M02/(&a-&mun1)) then estrato2=1;else estrato2=2;
+if estrato=1 then estrato2=1;
+/* distribuindo tamanho amostra */
+if estrato2=1 then ah=&mun1; /*tamanho de amostra para o estrato 1*/
+if estrato2=2 then ah=&a-&mun1; /*tamanho de amostra para o estrato 2*/
+run;
+
+/**criando tamanho_amostrah para selecionar no survey de forma estratificada**/
+proc freq data=freq_nm_mun noprint;
+tables estrato2*ah /out=tamanho_amostrah(drop=count percent);
+run;
+proc sort data=freq_nm_mun;by estrato2 CD_MUN;run;
+/** pode ser tanto pps quanto pps_sys, a diferença é que na sistemática a amostra será mais sistematizada **/
+proc surveyselect data=freq_nm_mun sampsize=tamanho_amostrah(rename=ah=_nsize_) 
+seed=3 out=amostra_mun method=pps;
+size tot_pop;
+strata estrato2;
+run;
+proc surveyselect data=freq_nm_mun sampsize=tamanho_amostrah(rename=ah=_nsize_) 
+seed=3 out=amostra_mun_sys method=pps_sys;
+size tot_pop;
+strata estrato2;
+run;
+
+/**tabela com total de setores censitários**/
+proc freq data=dados_al noprint;
+tables CD_MUN*NM_MUN /out=freq_nm_mun_sc(rename=(count=tot_sc) drop=percent);
+run;
+/** Verificando se o mb bate com a média dos m amostrados**/
+proc sort data=amostra_mun_sys;by CD_MUN;run;
+proc sort data=freq_nm_mun_sc;by CD_MUN;run;
+proc sql noprint;
+select sum(tot_sc) into: tot_mia from freq_nm_mun_sc /** total de setores censitários do municipio "a" **/
+where CD_MUN in (select CD_MUN from amostra_mun_sys);
+quit;
+%put &tot_mia; /** total de setores censitários nos "a" municipios selecionados **/
+data amostra_mun_sys;merge amostra_mun_sys(in=a) freq_nm_mun_sc;
+by CD_MUN;if a; 
+/**(in=a if a) não é em relação a nada das amostras. 
+É apenas para a tabela retirar os que não são match com os municipios selecionados**/
+mi=round(a*m_b*tot_sc/&tot_mia); /** fórmula do mi**/
+run; /***com essa saída o mi é usado para checar undersized
+se: mi > tot_sc 
+aí teríamos que voltar juntar esse municipio com o mais próximo e verificar se bateu a quantidade 
+lembrando que mudariamos o total de municipio dessa forma tendo que alterar no começo e rodar novamente ***/
+proc means data=amostra_mun_sys mean;
+var mi; /** tem que bater o mb essa média **/
+run;
+
+/*** tem que bater com o total da população ***/
+proc means data=Amostra_mun_sys sum ndec=2;
+var tot_pop;
+weight SamplingWeight;
+run;
+%put &M0;
+
+ 
+/*** Segundo Estágio ***/
+/* Exemplo sem trazer variavel do banco de amostra de municipios */
+proc sql;
+create table dados_al_sc as
+select * from dados_al /* "*" pegar todas variaveis, sem trazer do banco menor */
+where CD_MUN in (select CD_MUN from amostra_mun_sys);
+quit; /* traz somente os municipios amostrados com setores */
+  
+  
+/* Trazendo variaveis (peso, mi, pop_mun, p barra) da tabela com a amostra de municipios */ 
+
+proc sql;
+create table dados_al_sc as 
+select b.*, a.SamplingWeight as SamplingWeight1, a.mi, a.tot_pop, a.p_b from amostra_mun_sys a
+left join dados_al b
+on a.CD_MUN = b.CD_MUN;
+quit;
+
+/**também tem que bater o peso com o total populacional**/
+proc means data=dados_al_sc sum ndec=2;
+var v0001;
+weight SamplingWeight1;
+run;
+ 
+/* Realizando alocação proporcional para a SITUAÇÂO */
+proc freq data = dados_al_sc noprint;
+tables 'SITUACAO'n / out=Prop_mun_situacao(rename=(count = freq_setor_situacao percent=pct_situacao));
+by CD_MUN; /* saber proporção de situação em cada municipio */
+run; /* by é em relação ao total por municipio */
+ 
+proc freq data = dados_al_sc noprint;
+tables CD_MUN * 'SITUACAO'n / out=Pop_mun_situacao(drop=percent rename=count=pop_mun_situacao); /* saber proporção de situação em cada municipio */
+weight v0001;
+run;
+
+/* ordenar por situação e municipio */
+proc sort data=dados_al_sc;
+by CD_MUN 'SITUACAO'n;
+run;
+ 
+/* Juntando bancos com proporção e quantidade de setores por situação por municipio */
+data dados_al_sc;
+merge dados_al_sc Pop_mun_situacao Prop_mun_situacao;
+by CD_MUN 'SITUACAO'n;
+run;
+ 
+ 
+/* Verificando Oversized no segundo estagio - setores censitarios */
+data dados_al_sc; set dados_al_sc;
+CD_SETOR=trim(left(CD_SETOR));
+mih = round((mi*pct_situacao)/100); /* divide por 100 porque saida do SAS é por 100 (%) */
+if v0001 > pop_mun_situacao/mih then estrato=1;else estrato=2; /*** separando o oversize por estrato ***/
+peso_sc=pop_mun_situacao/(mih*v0001); /*** calculando o peso ***/ /* Mihj > mih/mihj */
+run;
+/* Não houve oversized */
+
+
+/* Não houve oversized */
+/* A intenção desse table é para saber a quantidade da amostra por municipio segundo a situação */
+proc freq data=dados_al_sc noprint;
+tables CD_MUN * 'SITUACAO'n *mih / out=tam_mun_set_sit(drop=percent);
+run;
+
+proc means data=tam_mun_set_sit mean sum;
+var mih;
+run;
+ 
+/* Selecionando amostra de setores censitarios em cada municipio selecionado no primeiro estagio */
+/* Estratificando por situação (Rural e Urbano) */
+proc surveyselect data=dados_al_sc sampsize=tam_mun_set_sit(rename=mih=_nsize_) 
+seed=3 out=amostra_mun_sys_sc method=pps_sys;
+size v0001;
+strata CD_MUN 'SITUACAO'n;
+run;
+
+/* checar o peso samplingweight1 * samplingweight = popoulação do estado */
+/* Criar uma variavel em amostra_mun_sys_sc, peso_mun_sc = samplingweight1 * samplingweight */
+data amostra_mun_sys_sc;set amostra_mun_sys_sc;
+peso_mun_sc = SamplingWeight1 * SamplingWeight;
+run;
+ 
+/* Verificando se peso_mun_sc bate com total populacional */
+
+proc means data=amostra_mun_sys_sc sum ndec=2;
+var v0001;
+weight peso_mun_sc;
+run;
+/* Bateu! */
+/**** importando CNEFE 3 estagio *****/
+proc import datafile='/home/u63366826/sasuser.v94/Trabalho amostragem 2/27_AL.csv'
+out=cnefe_al replace;
+delimiter=';';
+run;
+data cnefe_al;set cnefe_al(rename=COD_SETOR=COD_SETOR1);
+CD_SETOR=substr(COD_SETOR1,1,length(COD_SETOR1)-1);
+CD_MUN=trim(left(put(COD_MUNICIPIO,$7.)));
+drop COD_SETOR1;
+where COD_ESPECIE=1;
+run;
+
+/*** solucao 2 - sorteando os setores censitarios apenas que estao no CNEFE **/
+proc freq data=Dados_al_sc noprint;
+tables cd_mun*cd_setor /out=mun_setor2;
+run;
+proc freq data=cnefe_al noprint;
+tables cd_mun*cd_setor /out=mun_setor3;
+run;
+proc sql;
+create table mun_setor3 as
+select * from mun_setor3
+where cd_mun in (select distinct cd_mun from mun_setor2);
+quit;
+ 
+proc sql;
+create table Dados_al_sc2 as
+select * from Dados_al_sc
+where cd_setor in (select distinct cd_setor from mun_setor3);
+select sum(v0002) into:tot_dom from Dados_al_sc2;
+quit;
+ 
+data Dados_al_sc2;set Dados_al_sc2;
+ALEAT=ranuni(2);
+p=v0002/&tot_dom;
+Q=(ALEAT-ALEAT*p)/(p-ALEAT*p);
+if cd_setor='270430205070168' the Q=999999;
+run;
+proc sort data=Dados_al_sc2;by cd_mun SITUACAO Q;run;
+data Dados_al_sc2;set Dados_al_sc2;by cd_mun SITUACAO;
+if first.SITUACAO then seq=1;else seq+1;
+run;
+data amostra_mun_sys_sc;set Dados_al_sc2;
+where seq<=mih;
+run;
+data amostra_mun_sys_sc;set amostra_mun_sys_sc;
+peso_mun_sc = SamplingWeight1 * peso_sc;
+run;
+proc means data=amostra_mun_sys_sc sum ndec=2;
+var v0001;
+weight peso_mun_sc;
+run;
+%put &M0;
+ 
+proc sort data=amostra_mun_sys_sc;by CD_MUN CD_SETOR;run;
+proc sort data=dados_al;by CD_MUN CD_SETOR;run;
+proc means data=amostra_mun_sys_sc noprint nway;
+class CD_MUN SITUACAO;
+var v0002;
+output out=soma_pia (drop=_type_ _freq_) sum=tot_pia;
+run;
+ 
+proc sort data=amostra_mun_sys_sc;by CD_MUN SITUACAO;run;
+proc sort data=soma_pia;by CD_MUN SITUACAO;run;
+data amostra_mun_sys_sc; merge amostra_mun_sys_sc soma_pia;
+by CD_MUN SITUACAO;
+pihj=round(mih*p_b*v0002/tot_pia);
+if pihj<1 then pihj=1;
+v0001_dom=v0001/v0002;
+peso3=v0001/(pihj*v0001_dom);
+peso3d=v0002/pihj;
+CD_SETOR=trim(left(CD_SETOR));
+run;
+ 
+proc means data=amostra_mun_sys_sc mean ndec=2;
+class CD_MUN SITUACAO;
+var pihj;
+run;
+ 
+/**************************************************/
+proc sort data=cnefe_al;by CD_MUN CD_SETOR;run;
+proc sort data=amostra_mun_sys_sc;by CD_MUN CD_SETOR;run;
+data cnefe_al_mun_sc;merge cnefe_al amostra_mun_sys_sc(in=a keep=CD_MUN CD_SETOR 
+peso_mun_sc v0002 SITUACAO pihj peso3 v0001);
+by CD_MUN CD_SETOR;if a;
+run;
+proc sort data=cnefe_al_mun_sc;by CD_MUN SITUACAO CD_SETOR;run;
+proc freq data=cnefe_al_mun_sc noprint;
+tables CD_MUN*SITUACAO*CD_SETOR /out=v0002_cnefe(drop=percent
+rename=count=v0002_cnefe);
+run;
+data cnefe_al_mun_sc;merge cnefe_al_mun_sc v0002_cnefe;
+by CD_MUN SITUACAO CD_SETOR;
+v0001_dom=v0001/v0002_cnefe;
+if CD_MUN ne '';
+run;
+ 
+proc sort data=amostra_mun_sys_sc;by CD_MUN SITUACAO CD_SETOR;run;
+proc surveyselect data=cnefe_al_mun_sc sampsize=amostra_mun_sys_sc(rename=pihj=_nsize_)
+seed=3 out=amostra_mun_sys_sc_dom;
+strata CD_MUN SITUACAO CD_SETOR;
+run;
+ 
+data amostra_mun_sys_sc_dom;set amostra_mun_sys_sc_dom;
+peso3=v0001/(pihj*v0001_dom);
+peso_final=peso_mun_sc*SamplingWeight;
+run;
+ 
+proc means data=amostra_mun_sys_sc_dom sum ndec=2;
+var v0001_dom;
+class CD_MUN SITUACAO CD_SETOR;
+weight SamplingWeight;
+run;
+ 
+proc means data=amostra_mun_sys_sc_dom sum ndec=2;
+var v0001_dom;
+weight peso_final;
+run;
+%put &M0;
+
+/*** simulando dados ***/
+
+data amostra_mun_sys_sc_dom2;set amostra_mun_sys_sc_dom;
+call streaminit(3);
+pergunta=RAND('BERNOULLI',0.098);
+run;
+
+data tabela_final; 
+    set amostra_mun_sys_sc_dom2(drop= NUM_QUADRA NUM_FACE DSC_LOCALIDADE NOM_TIPO_SEGLOGR 
+    NOM_TITULO_SEGLOGR); 
+    endereco = catx(", ", NOM_SEGLOGR, NOM_COMP_ELEM1, VAL_COMP_ELEM1, NOM_COMP_ELEM2, VAL_COMP_ELEM2, 
+    NOM_COMP_ELEM3, VAL_COMP_ELEM3, NOM_COMP_ELEM4, VAL_COMP_ELEM4, NOM_COMP_ELEM5, VAL_COMP_ELEM5, 
+    "CEP:" || CEP);
+run;
+ 
+data tabela_final;
+    set tabela_final(drop = NUM_ENDERECO DSC_MODIFICADOR NOM_SEGLOGR NOM_COMP_ELEM1 VAL_COMP_ELEM1 NOM_COMP_ELEM2 VAL_COMP_ELEM2 
+    NOM_COMP_ELEM3 VAL_COMP_ELEM3 NOM_COMP_ELEM4 VAL_COMP_ELEM4 NOM_COMP_ELEM5 VAL_COMP_ELEM5 CEP 
+    COD_UNICO_ENDERECO COD_UF COD_DISTRITO COD_SUBDISTRITO NV_GEO_COORD DSC_ESTABELECIMENTO
+    COD_INDICADOR_ESTAB_ENDERECO COD_INDICADOR_CONST_ENDERECO COD_INDICADOR_FINALIDADE_CONST COD_TIPO_ESPECI);
+run;
+
+PROC EXPORT DATA=tabela_final
+    OUTFILE="/home/u63366826/sasuser.v94/Trabalho amostragem 2/tabela_amostra.xlsx"
+    DBMS=XLSX REPLACE;
+RUN;
+
+ODS EXCEL CLOSE;
+proc freq data=amostra_mun_sys_sc_dom2;
+tables pergunta;
+run;
+
+ods trace on;
+ods output domain=variancias;
+proc surveymeans data=amostra_mun_sys_sc_dom2;
+domain CD_MUN;
+clusters CD_SETOR;
+strata SITUACAO;
+var pergunta;
+weight peso_final;
+run;
+data variancias;set variancias;
+erro=(upperclmean-lowerclmean)/2;
+run;
+/* menos que 50% devido (apenas 4 municipios ficaram em torno de 50%) a aleatoriedade e seleção de amostra*/
+
+PROC SQL;
+    CREATE TABLE contagem_setores AS
+    SELECT cd_mun, COUNT(DISTINCT cd_setor) AS total_setores
+    FROM amostra_mun_sys_sc_dom
+    GROUP BY cd_mun;
+QUIT;
+
+proc mapimport datafile='/home/u63366826/sasuser.v94/Trabalho amostragem 2/AL_Municipios_2023.shp' 
+out=mun_AL;
+run;
+proc gmap data=contagem_setores map=mun_AL all;
+id cd_mun;
+choro cd_mun;
+run;
+quit;
+
+/*** importando shape file ****/
+PROC SQL;
+    CREATE TABLE contagem_dom AS
+    SELECT cd_mun,cd_setor, COUNT(*) AS total_dom
+    FROM amostra_mun_sys_sc_dom
+    GROUP BY cd_mun, cd_setor; 
+QUIT;
+
+proc mapimport datafile='/home/u63366826/sasuser.v94/Trabalho amostragem 2/AL_setores_CD2022.shp' 
+out=set_AL;
+run;
+/*proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2704302")) all;
+id cd_setor;
+choro total_dom;
+run;
+quit;*/
+/*Arapiraca*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2700300")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*Coité do Noía*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2702009")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*Igaci*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2703106")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*Maceió*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2704302")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*Marechal Deodoro*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2704708")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*Palmeira dos Índios*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2706307")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*Porto Real do Colégio*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2707503")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*São Luís do Quitunde*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2708501")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
+/*União dos Palmares*/
+proc gmap data=contagem_dom map=set_AL(where=(cd_mun="2709301")) all;
+id cd_setor;
+choro cd_setor;
+run;
+quit;
