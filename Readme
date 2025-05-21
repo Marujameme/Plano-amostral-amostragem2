@@ -1,0 +1,12 @@
+# Código SAS:
+## O código realiza a leitura e padronização dos bancos do IBGE e utiliza suas métricas para:
+### - Cálculo do custo estimado e o custo real
+### - Cálculo do tamanho de amostra
+### - Seleção das unidades
+### - Solução de Unidades Oversized
+### - Distribuição Espacial da Amostra
+
+# Requisitos:
+## - Banco de dados do IBGE
+### - Agregados_por_setores_basico_BR
+### - CNEFE: 27_AL
